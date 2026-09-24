@@ -1,11 +1,11 @@
 #include "mainwindow.h"
 
+#include "historyview.h"
+
 #include <QComboBox>
-#include <QFontDatabase>
 #include <QHBoxLayout>
-#include <QKeyEvent>
 #include <QLabel>
-#include <QPlainTextEdit>
+#include <QLineEdit>
 #include <QPushButton>
 #include <QSerialPortInfo>
 #include <QStatusBar>
@@ -32,11 +32,7 @@ MainWindow::MainWindow(QWidget *parent)
 
     m_openButton = new QPushButton;
 
-    m_formatBox = new QComboBox;
-    m_formatBox->addItem("ASCII", Ascii);
-    m_formatBox->addItem("BIN", Bin);
-    m_formatBox->addItem("HEX", Hex);
-
+    m_viewFormatBox = createFormatBox();
     auto *clearButton = new QPushButton(tr("Очистить"));
 
     auto *settingsLayout = new QHBoxLayout;
@@ -47,66 +43,60 @@ MainWindow::MainWindow(QWidget *parent)
     settingsLayout->addWidget(m_baudBox);
     settingsLayout->addWidget(m_openButton);
     settingsLayout->addStretch();
-    settingsLayout->addWidget(new QLabel(tr("Формат:")));
-    settingsLayout->addWidget(m_formatBox);
+    settingsLayout->addWidget(new QLabel(tr("Отображение:")));
+    settingsLayout->addWidget(m_viewFormatBox);
     settingsLayout->addWidget(clearButton);
 
-    const QFont monoFont = QFontDatabase::systemFont(QFontDatabase::FixedFont);
-
-    m_rxView = new QPlainTextEdit;
-    m_rxView->setReadOnly(true);
-    m_rxView->setFont(monoFont);
-
-    // Окно передачи только отображает данные: сами клавиши обрабатывает eventFilter.
-    m_txView = new QPlainTextEdit;
-    m_txView->setReadOnly(true);
-    m_txView->setFont(monoFont);
-    m_txView->setPlaceholderText(tr("Щёлкните сюда и нажимайте клавиши"));
-    m_txView->installEventFilter(this);
+    m_rxView = new HistoryView(&m_history, Direction::Rx, HistoryView::Layout::Stream);
+    m_txView = new HistoryView(&m_history, Direction::Tx, HistoryView::Layout::Lines);
 
     auto *rxLayout = new QVBoxLayout;
     rxLayout->addWidget(new QLabel(tr("Принято из порта")));
     rxLayout->addWidget(m_rxView);
 
     auto *txLayout = new QVBoxLayout;
-    txLayout->addWidget(new QLabel(tr("Нажатые клавиши (отправляются в порт)")));
+    txLayout->addWidget(new QLabel(tr("Отправлено в порт")));
     txLayout->addWidget(m_txView);
 
     auto *viewsLayout = new QHBoxLayout;
     viewsLayout->addLayout(rxLayout);
     viewsLayout->addLayout(txLayout);
 
+    // Строка ввода: текст разбирается в выбранном формате и уходит в порт по Enter.
+    m_inputFormatBox = createFormatBox();
+    m_input = new QLineEdit;
+    m_sendButton = new QPushButton(tr("Отправить"));
+
+    auto *inputLayout = new QHBoxLayout;
+    inputLayout->addWidget(new QLabel(tr("Ввод:")));
+    inputLayout->addWidget(m_inputFormatBox);
+    inputLayout->addWidget(m_input);
+    inputLayout->addWidget(m_sendButton);
+
     auto *central = new QWidget;
     auto *mainLayout = new QVBoxLayout(central);
     mainLayout->addLayout(settingsLayout);
     mainLayout->addLayout(viewsLayout);
+    mainLayout->addLayout(inputLayout);
     setCentralWidget(central);
 
     connect(m_refreshButton, &QPushButton::clicked, this, &MainWindow::refreshPorts);
     connect(m_openButton, &QPushButton::clicked, this, &MainWindow::togglePort);
-    connect(clearButton, &QPushButton::clicked, this, &MainWindow::clearViews);
-    connect(m_formatBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            this, &MainWindow::changeFormat);
+    connect(clearButton, &QPushButton::clicked, &m_history, &DataHistory::clear);
+    connect(m_viewFormatBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &MainWindow::changeViewFormat);
+    connect(m_inputFormatBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &MainWindow::changeInputFormat);
+    connect(m_input, &QLineEdit::returnPressed, this, &MainWindow::sendInput);
+    connect(m_sendButton, &QPushButton::clicked, this, &MainWindow::sendInput);
     connect(m_portBox, &QComboBox::editTextChanged, this, &MainWindow::updateControls);
     connect(&m_port, &QSerialPort::readyRead, this, &MainWindow::readData);
     connect(&m_port, &QSerialPort::errorOccurred, this, &MainWindow::handleError);
 
+    changeViewFormat();
+    changeInputFormat();
     refreshPorts();
     updateControls();
-}
-
-bool MainWindow::eventFilter(QObject *watched, QEvent *event)
-{
-    if (watched == m_txView && event->type() == QEvent::KeyPress) {
-        auto *keyEvent = static_cast<QKeyEvent *>(event);
-        const QByteArray data = keyEvent->text().toUtf8();
-        if (data.isEmpty())
-            return false;       // Shift, Ctrl, стрелки и т. п. - кода символа нет
-
-        sendData(data);
-        return true;
-    }
-    return QMainWindow::eventFilter(watched, event);
 }
 
 void MainWindow::refreshPorts()
@@ -151,7 +141,7 @@ void MainWindow::togglePort()
         statusBar()->showMessage(tr("Открыт %1, %2 бод, 8N1")
                                      .arg(m_port.portName())
                                      .arg(m_port.baudRate()));
-        m_txView->setFocus();
+        m_input->setFocus();
     } else {
         statusBar()->showMessage(tr("Не удалось открыть %1: %2")
                                      .arg(m_port.portName(), m_port.errorString()));
@@ -161,9 +151,7 @@ void MainWindow::togglePort()
 
 void MainWindow::readData()
 {
-    const QByteArray data = m_port.readAll();
-    m_rxData.append(data);
-    appendText(m_rxView, formatData(data, currentFormat()));
+    m_history.append(Direction::Rx, m_port.readAll());
 }
 
 void MainWindow::handleError(QSerialPort::SerialPortError error)
@@ -176,21 +164,56 @@ void MainWindow::handleError(QSerialPort::SerialPortError error)
     }
 }
 
-void MainWindow::changeFormat()
+void MainWindow::changeViewFormat()
 {
-    const Format format = currentFormat();
-    m_rxView->setPlainText(formatData(m_rxData, format));
-    m_txView->setPlainText(formatData(m_txData, format));
-    m_rxView->moveCursor(QTextCursor::End);
-    m_txView->moveCursor(QTextCursor::End);
+    const DataFormat *format = formatOf(m_viewFormatBox);
+    m_rxView->setFormat(format);
+    m_txView->setFormat(format);
 }
 
-void MainWindow::clearViews()
+void MainWindow::changeInputFormat()
 {
-    m_rxData.clear();
-    m_txData.clear();
-    m_rxView->clear();
-    m_txView->clear();
+    m_input->setPlaceholderText(formatOf(m_inputFormatBox)->inputHint());
+    m_input->setFocus();
+}
+
+void MainWindow::sendInput()
+{
+    if (!m_port.isOpen()) {
+        statusBar()->showMessage(tr("Порт закрыт: данные не отправлены"));
+        return;
+    }
+
+    QByteArray data;
+    QString error;
+    if (!formatOf(m_inputFormatBox)->fromText(m_input->text(), &data, &error)) {
+        statusBar()->showMessage(tr("Ошибка ввода: %1").arg(error));
+        return;     // текст остаётся в поле, чтобы его можно было исправить
+    }
+    if (data.isEmpty())
+        return;
+
+    if (m_port.write(data) != data.size()) {
+        statusBar()->showMessage(tr("Ошибка записи: %1").arg(m_port.errorString()));
+        return;
+    }
+
+    m_history.append(Direction::Tx, data);
+    m_input->clear();
+    statusBar()->clearMessage();
+}
+
+QComboBox *MainWindow::createFormatBox() const
+{
+    auto *box = new QComboBox;
+    for (int i = 0; i < m_formats.count(); ++i)
+        box->addItem(m_formats.at(i)->name(), i);
+    return box;
+}
+
+const DataFormat *MainWindow::formatOf(const QComboBox *box) const
+{
+    return m_formats.at(box->currentData().toInt());
 }
 
 QString MainWindow::selectedPortName() const
@@ -198,58 +221,6 @@ QString MainWindow::selectedPortName() const
     const QString text = m_portBox->currentText();
     const int index = m_portBox->findText(text);
     return index >= 0 ? m_portBox->itemData(index).toString() : text.trimmed();
-}
-
-MainWindow::Format MainWindow::currentFormat() const
-{
-    return static_cast<Format>(m_formatBox->currentData().toInt());
-}
-
-QString MainWindow::formatData(const QByteArray &data, Format format)
-{
-    QString result;
-    for (const char c : data) {
-        const auto byte = static_cast<unsigned char>(c);
-        switch (format) {
-        case Ascii:
-            if (byte == '\n')
-                result += '\n';
-            else if (byte == '\r')
-                ;               // строки с платы приходят с "\r\n", хватает '\n'
-            else if (byte >= 0x20 && byte < 0x7F)
-                result += QChar(byte);
-            else
-                result += '.';  // непечатаемый символ
-            break;
-        case Bin:
-            result += QString::number(byte, 2).rightJustified(8, '0') + ' ';
-            break;
-        case Hex:
-            result += QString::number(byte, 16).rightJustified(2, '0').toUpper() + ' ';
-            break;
-        }
-    }
-    return result;
-}
-
-void MainWindow::appendText(QPlainTextEdit *view, const QString &text)
-{
-    view->moveCursor(QTextCursor::End);
-    view->insertPlainText(text);
-    view->moveCursor(QTextCursor::End);
-}
-
-void MainWindow::sendData(const QByteArray &data)
-{
-    m_txData.append(data);
-    appendText(m_txView, formatData(data, currentFormat()));
-
-    if (!m_port.isOpen()) {
-        statusBar()->showMessage(tr("Порт закрыт: клавиша показана, но не отправлена"));
-        return;
-    }
-    if (m_port.write(data) != data.size())
-        statusBar()->showMessage(tr("Ошибка записи: %1").arg(m_port.errorString()));
 }
 
 void MainWindow::updateControls()
@@ -260,4 +231,5 @@ void MainWindow::updateControls()
     m_portBox->setEnabled(!open);
     m_baudBox->setEnabled(!open);
     m_refreshButton->setEnabled(!open);
+    m_sendButton->setEnabled(open);
 }

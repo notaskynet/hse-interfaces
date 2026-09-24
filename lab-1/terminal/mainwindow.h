@@ -1,11 +1,14 @@
 #pragma once
 
-#include <QByteArray>
+#include "datahistory.h"
+#include "formatregistry.h"
+
 #include <QMainWindow>
 #include <QSerialPort>
 
+class HistoryView;
 class QComboBox;
-class QPlainTextEdit;
+class QLineEdit;
 class QPushButton;
 
 class MainWindow : public QMainWindow
@@ -15,39 +18,33 @@ class MainWindow : public QMainWindow
 public:
     explicit MainWindow(QWidget *parent = nullptr);
 
-protected:
-    // Перехватывает нажатия клавиш в окне передачи.
-    bool eventFilter(QObject *watched, QEvent *event) override;
-
 private slots:
     void refreshPorts();
     void togglePort();
     void readData();
     void handleError(QSerialPort::SerialPortError error);
-    void changeFormat();
-    void clearViews();
+    void changeViewFormat();
+    void changeInputFormat();
+    void sendInput();
 
 private:
-    enum Format { Ascii, Bin, Hex };
-
+    QComboBox *createFormatBox() const;
+    const DataFormat *formatOf(const QComboBox *box) const;
     QString selectedPortName() const;
-    Format currentFormat() const;
-    static QString formatData(const QByteArray &data, Format format);
-    static void appendText(QPlainTextEdit *view, const QString &text);
-    void sendData(const QByteArray &data);
     void updateControls();
 
     QSerialPort m_port;
-
-    // Сырые байты хранятся отдельно, чтобы при смене формата перерисовать окна.
-    QByteArray m_rxData;
-    QByteArray m_txData;
+    FormatRegistry m_formats = FormatRegistry::createDefault();
+    DataHistory m_history;
 
     QComboBox *m_portBox;
     QComboBox *m_baudBox;
-    QComboBox *m_formatBox;
+    QComboBox *m_viewFormatBox;
+    QComboBox *m_inputFormatBox;
     QPushButton *m_refreshButton;
     QPushButton *m_openButton;
-    QPlainTextEdit *m_rxView;
-    QPlainTextEdit *m_txView;
+    QPushButton *m_sendButton;
+    QLineEdit *m_input;
+    HistoryView *m_rxView;
+    HistoryView *m_txView;
 };
